@@ -325,6 +325,13 @@ class TabCorr:
         if project_xyz and mode == 'auto':
             tpcf_matrix /= 3.0
 
+        if mode == 'auto':
+            tpcf_matrix_flat = []
+            for i in range(tpcf_matrix.shape[0]):
+                tpcf_matrix_flat.append(symmetric_matrix_to_array(
+                    tpcf_matrix[i]))
+            tpcf_matrix = np.array(tpcf_matrix_flat)
+
         halotab.attrs = {}
         halotab.attrs['tpcf'] = tpcf.__name__
         halotab.attrs['mode'] = mode
@@ -367,15 +374,7 @@ class TabCorr:
         for key in fstream.attrs.keys():
             halotab.attrs[key] = fstream.attrs[key]
 
-        tpcf_matrix = fstream['tpcf_matrix'][()]
-        if halotab.attrs['mode'] == 'auto' and len(tpcf_matrix.shape) == 2:
-            halotab.tpcf_matrix = []
-            for i in range(tpcf_matrix.shape[0]):
-                halotab.tpcf_matrix.append(array_to_symmetric_matrix(
-                    tpcf_matrix[i]))
-            halotab.tpcf_matrix = np.array(halotab.tpcf_matrix)
-        else:
-            halotab.tpcf_matrix = tpcf_matrix
+        halotab.tpcf_matrix = fstream['tpcf_matrix'][()]
 
         halotab.tpcf_args = []
         for key in fstream['tpcf_args'].keys():
@@ -420,15 +419,7 @@ class TabCorr:
         for key in keys:
             fstream.attrs[key] = self.attrs[key]
 
-        if self.attrs['mode'] == 'auto':
-            tpcf_matrix_write = []
-            for i in range(self.tpcf_matrix.shape[0]):
-                tpcf_matrix_write.append(symmetric_matrix_to_array(
-                    self.tpcf_matrix[i]))
-            fstream['tpcf_matrix'] = np.array(tpcf_matrix_write,
-                                              dtype=matrix_dtype)
-        else:
-            fstream['tpcf_matrix'] = self.tpcf_matrix.astype(matrix_dtype)
+        fstream['tpcf_matrix'] = self.tpcf_matrix.astype(matrix_dtype)
 
         for i, arg in enumerate(self.tpcf_args):
             if (type(arg) is not np.ndarray or
@@ -525,16 +516,16 @@ class TabCorr:
         ngal = mean_occupation * self.gal_type['n_h'].data
 
         if self.attrs['mode'] == 'auto':
-            xi = self.tpcf_matrix * np.outer(ngal, ngal) / np.sum(ngal)**2
+            ngal_sq = np.outer(ngal, ngal)
+            ngal_sq = 2 * ngal_sq - np.diag(np.diag(ngal_sq))
+            ngal_sq = symmetric_matrix_to_array(ngal_sq)
+            xi = self.tpcf_matrix * ngal_sq / np.sum(ngal_sq)
         elif self.attrs['mode'] == 'cross':
             xi = self.tpcf_matrix * ngal / np.sum(ngal)
 
         if not separate_gal_type:
             ngal = np.sum(ngal)
-            if self.attrs['mode'] == 'auto':
-                xi = np.sum(xi, axis=(1, 2)).reshape(self.tpcf_shape)
-            elif self.attrs['mode'] == 'cross':
-                xi = np.sum(xi, axis=1).reshape(self.tpcf_shape)
+            xi = np.sum(xi, axis=1).reshape(self.tpcf_shape)
             return ngal, xi
         else:
             ngal_dict = {}
@@ -545,17 +536,17 @@ class TabCorr:
                 ngal_dict[gal_type] = np.sum(ngal[mask])
 
             if self.attrs['mode'] == 'auto':
-                grid = np.meshgrid(self.gal_type['gal_type'],
-                                   self.gal_type['gal_type'])
                 for gal_type_1, gal_type_2 in (
                         itertools.combinations_with_replacement(
                             np.unique(self.gal_type['gal_type']), 2)):
-                    mask = (((gal_type_1 == grid[0]) &
-                             (gal_type_2 == grid[1])) |
-                            ((gal_type_1 == grid[1]) &
-                             (gal_type_2 == grid[0])))
+                    mask = symmetric_matrix_to_array(np.outer(
+                        gal_type_1 == self.gal_type['gal_type'],
+                        gal_type_2 == self.gal_type['gal_type']) |
+                            np.outer(
+                        gal_type_2 == self.gal_type['gal_type'],
+                        gal_type_1 == self.gal_type['gal_type']))
                     xi_dict['%s-%s' % (gal_type_1, gal_type_2)] = np.sum(
-                        xi * mask, axis=(1, 2)).reshape(self.tpcf_shape)
+                        xi * mask, axis=1).reshape(self.tpcf_shape)
 
             elif self.attrs['mode'] == 'cross':
                 for gal_type in np.unique(self.gal_type['gal_type']):
@@ -694,38 +685,12 @@ def symmetric_matrix_to_array(matrix):
     except AssertionError:
         raise RuntimeError('The matrix you provided is not symmetric.')
 
-    array = np.zeros((np.prod(matrix.shape) + matrix.shape[0]) // 2,
-                     dtype=matrix.dtype)
+    n_dim = matrix.shape[0]
+    sel = np.zeros((n_dim**2 + n_dim) // 2, dtype=np.int)
 
-    k = 0
     for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            if j > i:
-                continue
-            else:
-                array[k] = matrix[i, j]
-                k = k + 1
+        sel[(i*(i+1))//2:(i*(i+1))//2+(i+1)] = np.arange(
+            i*n_dim, i*n_dim + i + 1)
 
-    return array
+    return matrix.ravel()[sel]
 
-
-def array_to_symmetric_matrix(array):
-
-    dim = int(np.rint(-0.5 + np.sqrt(0.25 + len(array) * 2)))
-
-    try:
-        assert len(array) == (dim**2 + dim) / 2
-    except AssertionError:
-        raise RuntimeError('The length of the array does not correspond to a' +
-                           ' symmetric matrix.')
-
-    matrix = np.zeros((dim, dim), dtype=array.dtype)
-
-    k = 0
-    for i in range(matrix.shape[0]):
-        matrix[i, :i+1] = array[k:k+i+1]
-        k = k + i + 1
-
-    matrix = matrix + matrix.T - matrix * np.identity(matrix.shape[0])
-
-    return matrix
