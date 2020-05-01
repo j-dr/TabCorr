@@ -557,124 +557,139 @@ class TabCorr:
             return ngal_dict, xi_dict
 
 
-def interpolate_predict(tabcorr_arr, x, xi, model, extrapolate=True,
-                        **occ_kwargs):
-    """
-    Linearly interprets the predictions from multiple TabCorr instances. Each
-    TabCorr instance will have a corresponding x-value and this function
-    finds a linear/barycentric interpolation for an intermediate point xi. For
-    example, this function can be used for predict correlation functions
-    for continues choices of concentrations for satellites.
+class TabCorrInterpolation:
 
-    Parameters
-    ----------
-    tabcorr_arr : array_like
-        TabCorr instances used to interpolate.
+    def __init__(self, tabcorr_list, param_dict_table):
+        """
+        Initialize an interpolation of multiple TabCorr instances.
 
-    x : array_like
-        Array of shape (npts) or (npts, ndim). Here, npts is the number of
-        TabCorr instances and ndim the number of dimensions over which
-        we will interpolate.
+        Parameters
+        ----------
+        tabcorr_list : array_like
+            TabCorr instances used to interpolate.
 
-    xi : float or array_like
-        x-value at which to interpolate. If x has shape (npts), xi must have
-        be a float. On the other hand, if x has shape (npts, ndim), xi must
-        be an array of len ndim.
+        param_dict_table : astropy.table.Table
+            Table containing the keywords and values corresponding to the
+            TabCorr list. Must have the same length and ordering as
+            tabcorr_list.
+        """
 
-    model : HodModelFactory
-        Instance of ``halotools.empirical_models.HodModelFactory``
-        describing the model for which predictions are made.
+        if len(tabcorr_list) != len(param_dict_table):
+            raise RuntimeError('The length of tabcorr_list does not match ' +
+                               'the number of entries in param_dict_table.')
 
-    extrapolate : boolean, optional
-        Whether to allow extrapolation beyond points sampled by x. If set to
-        False, attempting to extrapolate will result in a RuntimeError.
+        self.keys = param_dict_table.colnames
+        self.n_dim = len(self.keys)
+        self.n_pts = len(param_dict_table)
+        self.tabcorr_list = tabcorr_list
 
-    **occ_kwargs : dict, optional
-            Keyword arguments passed to the ``mean_occupation`` functions of
-            the model.
+        if self.n_pts < self.n_dim + 1:
+            raise RuntimeError('The number of TabCorr instances provided ' +
+                               'must be at least the number of dimensions ' +
+                               'plus 1.')
 
-    Returns
-    -------
-    ngal : numpy.array or dict
-        Array containing the number densities for each galaxy type stored in
-        self.gal_type. The total galaxy number density is the sum of all
-        elements of this array.
-
-    xi : numpy.array or dict
-        Array storing the prediction for the correlation function.
-    """
-
-    try:
-        assert isinstance(x, list) or isinstance(x, np.ndarray)
-        x = np.array(x)
-        assert (x.ndim == 1) or (x.ndim == 2)
-    except AssertionError:
-        raise RuntimeError('x must be a one or two-dimensional array.')
-
-    if x.ndim == 1:
-        n_points = x.shape[0]
-        n_dim = 1
-    elif x.ndim == 2:
-        n_points = x.shape[0]
-        n_dim = x.shape[1]
-    if n_points <= n_dim:
-        raise RuntimeError('x must contain more points than dimensions.')
-
-    try:
-        if n_dim == 1:
-            assert isinstance(xi, float)
+        if self.n_dim == 0:
+            raise RuntimeError('param_dict_table is empty.')
+        if self.n_dim == 1:
+            self.x = param_dict_table.columns[0].data
         else:
-            assert isinstance(xi, list) or isinstance(xi, np.ndarray)
-            xi = np.array(xi)
-            assert xi.ndim == 1
-            assert len(xi) == n_dim
-    except AssertionError:
-        raise RuntimeError('xi must match the dimensionality of x.')
+            self.x = np.empty((self.n_pts, self.n_dim))
+            for i, key in enumerate(param_dict_table.colnames):
+                self.x[:, i] = param_dict_table[key].data
+            self.delaunay = Delaunay(self.x)
 
-    if n_points != len(tabcorr_arr):
-        raise RuntimeError('The length of tabcorr_arr does not match the ' +
-                           'number of points provided via x.')
+    def predict(self, model, extrapolate=True, **occ_kwargs):
+        """
+        Linearly interpolate the predictions from multiple TabCorr instances.
+        For example, this function can be used for predict correlation
+        functions for continues choices of concentrations for satellites.
+        Parameters to linearly interpolate over should be in the parameter
+        dictionary of the model.
 
-    if n_dim > 1:
+        Parameters
+        ----------
+        model : HodModelFactory
+            Instance of ``halotools.empirical_models.HodModelFactory``
+            describing the model for which predictions are made.
 
-        tri = Delaunay(x)
-        i = tri.find_simplex(xi)
-        if i != -1:
-            s = tri.simplices[i]
-        if i == -1:
-            if not extrapolate:
-                raise RuntimeError('x is outside of the interpolation range.')
+        separate_gal_type : boolean, optional
+            If True, the return values are dictionaries divided by each galaxy
+            types contribution to the output result.
+
+        extrapolate : boolean, optional
+            Whether to allow extrapolation beyond points sampled by x. If set
+            to False, attempting to extrapolate will result in a RuntimeError.
+
+        **occ_kwargs : dict, optional
+                Keyword arguments passed to the ``mean_occupation`` functions
+                of the model.
+
+        Returns
+        -------
+        ngal : numpy.array or dict
+            Array containing the number densities for each galaxy type stored
+            in self.gal_type. The total galaxy number density is the sum of all
+            elements of this array.
+
+        xi : numpy.array or dict
+            Array storing the prediction for the correlation function.
+        """
+
+        x_model = np.empty(self.n_dim)
+        for i in range(self.n_dim):
+            try:
+                x_model[i] = model.param_dict[self.keys[i]]
+            except KeyError:
+                raise RuntimeError('key {} not present '.format(self.keys[i]) +
+                                   'in the parameter dictionary of the model.')
+
+        if self.n_dim > 1:
+
+            i_simplex = self.delaunay.find_simplex(x_model)
+
+            if i_simplex == -1:
+                if not extrapolate:
+                    raise RuntimeError('The parameters of the model are ' +
+                                       'outside of the interpolation range ' +
+                                       'and extrapolation is turned off.')
+                else:
+                    x_cm = np.mean(self.x[self.delaunay.simplices], axis=1)
+                    i_simplex = np.argmin(np.sum((x_model - x_cm)**2, axis=1))
+
+            simplex = self.delaunay.simplices[i_simplex]
+            b = self.delaunay.transform[i_simplex, :-1].dot(
+                x_model - self.delaunay.transform[i_simplex, -1])
+            w = np.append(b, 1 - np.sum(b))
+
+        else:
+
+            if np.any(x_model < self.x) and np.any(x_model > self.x):
+                simplex = [np.ma.MaskedArray.argmax(
+                    np.ma.masked_array(self.x, mask=(self.x > x_model))),
+                           np.ma.MaskedArray.argmin(
+                    np.ma.masked_array(self.x, mask=(self.x < x_model)))]
             else:
-                x_cm = np.mean(x[tri.simplices], axis=1)
-                i = np.argmin(np.sum((xi - x_cm)**2, axis=1))  # closest simplex
+                if not extrapolate:
+                    raise RuntimeError('The parameters of the model are ' +
+                                       'outside of the interpolation range ' +
+                                       'and extrapolation is turned off.')
+                else:
+                    simplex = np.argsort(np.abs(x_model - self.x))[:2]
 
-        s = tri.simplices[i]
-        b = tri.transform[i, :-1].dot(xi - tri.transform[i, -1])
-        w = np.append(b, 1 - np.sum(b))
+            w1 = (self.x[simplex[1]] - x_model) / (
+                self.x[simplex[1]] - self.x[simplex[0]])
+            w = [w1, 1 - w1]
 
-    else:
-
-        if np.any(x < xi) and np.any(x > xi):
-            s = [np.ma.MaskedArray.argmax(np.ma.masked_array(x, mask=(x > xi))),
-                 np.ma.MaskedArray.argmin(np.ma.masked_array(x, mask=(x < xi)))]
-        else:
-            if not extrapolate:
-                raise RuntimeError('x is outside of the interpolation range.')
+        for i, k in enumerate(simplex):
+            ngal_i, xi_i = self.tabcorr_list[k].predict(model, **occ_kwargs)
+            if i == 0:
+                ngal = ngal_i * w[i]
+                xi = xi_i * w[i]
             else:
-                s = np.argsort(np.abs(xi - x))[:2]
+                ngal += ngal_i * w[i]
+                xi += xi_i * w[i]
 
-        w = np.array([x[s[1]] - xi, xi - x[s[0]]]) / (x[s[1]] - x[s[0]])
-
-    for i in range(len(s)):
-        ngal_i, xi_i = tabcorr_arr[s[i]].predict(model, **occ_kwargs)
-        if i == 0:
-            ngal = ngal_i * w[i]
-            xi = xi_i * w[i]
-        else:
-            ngal += ngal_i * w[i]
-            xi += xi_i * w[i]
-
-    return ngal, xi
+        return ngal, xi
 
 
 def symmetric_matrix_to_array(matrix):
