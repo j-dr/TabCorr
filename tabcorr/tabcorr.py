@@ -520,6 +520,14 @@ class TabCorr:
             ngal_sq = 2 * ngal_sq - np.diag(np.diag(ngal_sq))
             ngal_sq = symmetric_matrix_to_array(ngal_sq)
             xi = self.tpcf_matrix * ngal_sq / np.sum(ngal_sq)
+            if ('TabCorr:A_P' in model.param_dict and
+                    model.param_dict['TabCorr:A_P'] != 1):
+                weight = (np.eye(len(ngal)) - np.eye(len(ngal), k=-1) / 2 -
+                          np.eye(len(ngal), k=+1) / 2)
+                weight = symmetric_matrix_to_array(weight)
+                weight = weight * (model.param_dict['TabCorr:A_P'] - 1)
+                xi += self.tpcf_matrix * weight * ngal_sq / np.sum(ngal_sq)
+                
         elif self.attrs['mode'] == 'cross':
             xi = self.tpcf_matrix * ngal / np.sum(ngal)
 
