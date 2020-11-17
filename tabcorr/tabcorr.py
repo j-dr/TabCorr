@@ -29,7 +29,6 @@ class TabCorr:
     def tabulate(cls, halocat, tpcf, *tpcf_args,
                  mode='auto',
                  Num_ptcl_requirement=sim_defaults.Num_ptcl_requirement,
-                 cosmology=sim_defaults.default_cosmology,
                  prim_haloprop_key=model_defaults.prim_haloprop_key,
                  prim_haloprop_bins=100,
                  sec_haloprop_key=model_defaults.sec_haloprop_key,
@@ -37,7 +36,7 @@ class TabCorr:
                  sats_per_prim_haloprop=3e-12, downsample=1.0,
                  verbose=False, redshift_space_distortions=True,
                  cens_prof_model=None, sats_prof_model=None, project_xyz=False,
-                 cosmology_ref=None, **tpcf_kwargs):
+                 cosmology_obs=None, **tpcf_kwargs):
         """
         Tabulates correlation functions for halos such that galaxy correlation
         functions can be calculated rapidly.
@@ -72,11 +71,6 @@ class TabCorr:
             Default value is set in
             `~halotools.sim_defaults.Num_ptcl_requirement`.
 
-        cosmology : object, optional
-            Instance of an astropy `~astropy.cosmology`. Default cosmology is
-            set in `~halotools.sim_manager.sim_defaults`. This might be used to
-            calculate phase-space distributions and redshift space distortions.
-
         prim_haloprop_key : string, optional
             String giving the column name of the primary halo property
             governing the occupation statistics of gal_type galaxies. Default
@@ -107,11 +101,14 @@ class TabCorr:
             expectation value of ``sats_per_prim_haloprop`` times the primary
             halo property.
 
-        downsample : float, optional
+        downsample : float or function, optional
             Fraction between 0 and 1 used to downsample the total sample used
             to tabulate correlation functions. Values below unity can be used
             to reduce the computation time. It should not result in biases but
-            the resulting correlation functions will be less accurate.
+            the resulting correlation functions will be less accurate. If
+            float, the same value is applied to all halos. If function, it
+            should return the fraction is a function of the primary halo
+            property.
 
         verbose : boolean, optional
             Boolean determing whether the progress should be displayed.
@@ -134,6 +131,16 @@ class TabCorr:
         project_xyz : bool, optional
             If True, the coordinates will be projected along all three spatial
             axes. By default, only the projection onto the z-axis is used.
+
+        cosmology_obs : object, optional
+            Instance of an astropy `~astropy.cosmology`. This can be used to
+            correct coordinates in the simulation for the Alcock-Paczynski (AP)
+            effect, i.e. a mismatch between the cosmology of the model
+            (simulation) and the cosmology used to interpret observations. Note
+            that the cosmology of the simulation is part of the halocat object.
+            If None, no correction for the AP effect is applied. Also, a
+            correction for the AP effect is only applied for auto-correlation
+            functions.
 
         **tpcf_kwargs : dict, optional
                 Keyword arguments passed to the ``tpcf`` function.
@@ -159,14 +166,14 @@ class TabCorr:
 
         halotab = cls()
 
-        if cosmology_ref is not None and mode == 'auto':
+        if cosmology_obs is not None and mode == 'auto':
             rp_stretch = (
-                (cosmology_ref.comoving_distance(halocat.redshift) *
-                 cosmology_ref.H0) /
-                (cosmology.comoving_distance(halocat.redshift) *
-                 cosmology.H0))
-            pi_stretch = (cosmology.efunc(halocat.redshift) /
-                          cosmology_ref.efunc(halocat.redshift))
+                (cosmology_obs.comoving_distance(halocat.redshift) *
+                 cosmology_obs.H0) /
+                (halocat.cosmology.comoving_distance(halocat.redshift) *
+                 halocat.cosmology.H0))
+            pi_stretch = (halocat.cosmology.efunc(halocat.redshift) /
+                          cosmology_obs.efunc(halocat.redshift))
             lbox_stretch = np.array([rp_stretch, rp_stretch, pi_stretch])
         else:
             lbox_stretch = np.ones(3)
@@ -244,7 +251,11 @@ class TabCorr:
         model.param_dict['logM1'] = - np.log10(sats_per_prim_haloprop)
         model.populate_mock(halocat, Num_ptcl_requirement=Num_ptcl_requirement)
         gals = model.mock.galaxy_table
-        gals = gals[np.random.random(len(gals)) < downsample]
+        if isinstance(downsample, float):
+            gals = gals[np.random.random(len(gals)) < downsample]
+        else:
+            gals = gals[np.random.random(len(gals)) <
+                        downsample(gals[prim_haloprop_key])]
 
         idx_gals, idx_halos = crossmatch(gals['halo_id'], halos['halo_id'])
         assert np.all(gals['halo_id'][idx_gals] == halos['halo_id'][idx_halos])
@@ -256,11 +267,12 @@ class TabCorr:
             print("Number of tracer particles: {0}".format(len(gals)))
 
         for xyz in ['xyz', 'yzx', 'zxy']:
-            pos_all = return_xyz_formatted_array(
+            pos_all = (return_xyz_formatted_array(
                 x=gals[xyz[0]], y=gals[xyz[1]], z=gals[xyz[2]],
                 velocity=gals['v'+xyz[2]] if redshift_space_distortions else 0,
                 velocity_distortion_dimension='z', period=halocat.Lbox,
-                redshift=halocat.redshift, cosmology=cosmology) * lbox_stretch
+                redshift=halocat.redshift, cosmology=halocat.cosmology) *
+                lbox_stretch)
 
             pos = []
             n_gals = []
@@ -283,7 +295,7 @@ class TabCorr:
             n_gals = np.array(n_gals)
             n_done = 0
 
-            if verbose:
+            if verbose and project_xyz:
                 print("Projecting onto {0}-axis...".format(xyz[2]))
 
             for i in range(len(halotab.gal_type)):
