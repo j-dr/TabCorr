@@ -456,7 +456,7 @@ class TabCorr:
 
         self.gal_type.write(fname, path='gal_type', append=True)
 
-    def predict(self, model, separate_gal_type=False, bernoulli=False,
+    def predict(self, model, separate_gal_type=False, subpoisson=False,
                 **occ_kwargs):
         """
         Predicts the number density and correlation function for a certain
@@ -543,7 +543,7 @@ class TabCorr:
             ngal_sq = 2 * ngal_sq - np.diag(np.diag(ngal_sq))
             ngal_sq = symmetric_matrix_to_array(ngal_sq)
             xi = self.tpcf_matrix * ngal_sq / np.sum(ngal_sq)
-            if bernoulli:
+            if subpoisson:
                 ss_p = mean_occupation**2
                 ss_np = (2 * mean_occupation * np.floor(mean_occupation) -
                          np.floor(mean_occupation) *
