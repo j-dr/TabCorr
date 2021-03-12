@@ -300,12 +300,12 @@ class TabCorr:
                 size = comm.size
                 rank = comm.rank
                 gal_type_index = gal_type_index[rank::size]
-                print('{}: Got {} gal types to compute'.format(rank, len(gal_type_index)))
+                
 
             for i in gal_type_index:
 
                 if mode == 'auto':
-                    for k in range(i, len(halotab.gal_type)):
+                    for k in np.arange(i, len(halotab.gal_type)):
                         if len(pos[i]) * len(pos[k]) > 0:
 
                             if verbose:
@@ -317,25 +317,22 @@ class TabCorr:
                                 else:
                                     n_done += (n_gals[i] * n_gals[k] * (
                                             2 if k != i else 1))
-                                    print_progress(n_done / np.sum(n_gals)**2)                                    
-
-                            xi = tpcf(
-                                pos[i], *tpcf_args,
-                                sample2=pos[k] if k != i else None,
-                                do_auto=(i == k), do_cross=(not i == k),
-                                period=halocat.Lbox * lbox_stretch,
-                                **tpcf_kwargs)
-                            
-                            #print('{}: xi_{}{} = {}'.format(rank, i, k, xi))
-
-                            if xi is None:
-                                print(tpcf)
-                                print(tpcf_args)
-                                print(tpcf_kwargs)
-                                print('{}: pos_{} = {}'.format(rank, i, pos[i]))
-                                print('{}: pos_{} = {}'.format(rank, k, pos[k]))
+                                    print_progress(n_done / np.sum(n_gals)**2)
+                            if i==k:
+                                xi = tpcf(
+                                    pos[i], *tpcf_args,
+                                    sample2=pos[k] if k != i else None,
+                                    do_auto=True, do_cross=False,
+                                    period=halocat.Lbox * lbox_stretch,
+                                    **tpcf_kwargs)
+                            else:
+                                xi = tpcf(
+                                    pos[i], *tpcf_args,
+                                    sample2=pos[k] if k != i else None,
+                                    do_auto=False, do_cross=True,
+                                    period=halocat.Lbox * lbox_stretch,
+                                    **tpcf_kwargs)                                
                                 
-                            sys.stdout.flush()
                             if 'tpcf_matrix' not in locals():
                                 tpcf_matrix = np.zeros(
                                     (len(xi.ravel()), len(halotab.gal_type),
@@ -366,7 +363,7 @@ class TabCorr:
                 break
         
         if comm:
-            tpcf_matrix = comm.reduce(tpcf_matrix, op=MPI.SUM)
+            tpcf_matrix = comm.allreduce(tpcf_matrix, op=MPI.SUM)
 
         if project_xyz and mode == 'auto':
             tpcf_matrix /= 3.0
