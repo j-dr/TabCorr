@@ -10,7 +10,12 @@ from halotools.mock_observables import return_xyz_formatted_array
 from halotools.sim_manager import sim_defaults
 from halotools.utils import crossmatch
 from halotools.utils.table_utils import compute_conditional_percentiles
-
+import sys
+try:
+    from mpi4py import MPI
+except ImportError as e:
+    print(e)
+    pass
 
 def print_progress(progress):
     percent = "{0:.1f}".format(100 * progress)
@@ -37,7 +42,7 @@ class TabCorr:
                  sats_per_prim_haloprop=3e-12, downsample=1.0,
                  verbose=False, redshift_space_distortions=True,
                  cens_prof_model=None, sats_prof_model=None, project_xyz=False,
-                 cosmology_ref=None, **tpcf_kwargs):
+                 cosmology_ref=None, comm=None, **tpcf_kwargs):
         """
         Tabulates correlation functions for halos such that galaxy correlation
         functions can be calculated rapidly.
@@ -134,6 +139,9 @@ class TabCorr:
         project_xyz : bool, optional
             If True, the coordinates will be projected along all three spatial
             axes. By default, only the projection onto the z-axis is used.
+
+        comm : MPI communicator
+            If not None, then will distribute calculation via MPI
 
         **tpcf_kwargs : dict, optional
                 Keyword arguments passed to the ``tpcf`` function.
@@ -286,16 +294,30 @@ class TabCorr:
             if verbose:
                 print("Projecting onto {0}-axis...".format(xyz[2]))
 
-            for i in range(len(halotab.gal_type)):
+            gal_type_index = np.arange(len(halotab.gal_type))
+
+            if comm is not None:
+                size = comm.size
+                rank = comm.rank
+                gal_type_index = gal_type_index[rank::size]
+                print('{}: Got {} gal types to compute'.format(rank, len(gal_type_index)))
+
+            for i in gal_type_index:
 
                 if mode == 'auto':
                     for k in range(i, len(halotab.gal_type)):
                         if len(pos[i]) * len(pos[k]) > 0:
 
                             if verbose:
-                                n_done += (n_gals[i] * n_gals[k] * (
-                                    2 if k != i else 1))
-                                print_progress(n_done / np.sum(n_gals)**2)
+                                if comm:
+                                    if comm.rank == 0:
+                                        n_done += (n_gals[i] * n_gals[k] * (
+                                            2 if k != i else 1))
+                                        print_progress(n_done / np.sum(n_gals)**2)
+                                else:
+                                    n_done += (n_gals[i] * n_gals[k] * (
+                                            2 if k != i else 1))
+                                    print_progress(n_done / np.sum(n_gals)**2)                                    
 
                             xi = tpcf(
                                 pos[i], *tpcf_args,
@@ -303,6 +325,17 @@ class TabCorr:
                                 do_auto=(i == k), do_cross=(not i == k),
                                 period=halocat.Lbox * lbox_stretch,
                                 **tpcf_kwargs)
+                            
+                            #print('{}: xi_{}{} = {}'.format(rank, i, k, xi))
+
+                            if xi is None:
+                                print(tpcf)
+                                print(tpcf_args)
+                                print(tpcf_kwargs)
+                                print('{}: pos_{} = {}'.format(rank, i, pos[i]))
+                                print('{}: pos_{} = {}'.format(rank, k, pos[k]))
+                                
+                            sys.stdout.flush()
                             if 'tpcf_matrix' not in locals():
                                 tpcf_matrix = np.zeros(
                                     (len(xi.ravel()), len(halotab.gal_type),
@@ -331,6 +364,9 @@ class TabCorr:
 
             if not project_xyz or mode == 'cross':
                 break
+        
+        if comm:
+            tpcf_matrix = comm.reduce(tpcf_matrix, op=MPI.SUM)
 
         if project_xyz and mode == 'auto':
             tpcf_matrix /= 3.0
