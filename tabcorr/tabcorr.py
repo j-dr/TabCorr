@@ -10,12 +10,31 @@ from halotools.mock_observables import return_xyz_formatted_array
 from halotools.sim_manager import sim_defaults
 from halotools.utils import crossmatch
 from halotools.utils.table_utils import compute_conditional_percentiles
-import sys
+from halotools.mock_observables.surface_density.surface_density_helpers import annular_area_weighted_midpoints
+from time import time
+import sys, os
+
+from scipy.interpolate import splrep, splev
+from scipy.integrate import quad
+
 try:
     from mpi4py import MPI
+    has_mpi = True
 except ImportError as e:
     print(e)
+    has_mpi = False
     pass
+
+try:
+    import baryonification as bfc
+    from colossus.cosmology import cosmology
+    from colossus.halo import concentration
+    has_bcm = True
+except ImportError as e:
+    print(e)
+    has_bcm = False
+    pass
+
 
 def print_progress(progress):
     percent = "{0:.1f}".format(100 * progress)
@@ -296,11 +315,15 @@ class TabCorr:
 
             gal_type_index = np.arange(len(halotab.gal_type))
 
-            if comm is not None:
+            if (comm is not None) & (has_mpi):
                 size = comm.size
                 rank = comm.rank
                 gal_type_index = gal_type_index[rank::size]
-                
+                print('{}: len(gal_type_index)={}'.format(
+                    rank, len(gal_type_index)))
+            elif (comm is not None) & (not has_mpi):
+                raise(ImportError(
+                    "You passed something to the comm argument, but I couldn't import mpi4py"))
 
             for i in gal_type_index:
 
@@ -313,12 +336,13 @@ class TabCorr:
                                     if comm.rank == 0:
                                         n_done += (n_gals[i] * n_gals[k] * (
                                             2 if k != i else 1))
-                                        print_progress(n_done / np.sum(n_gals)**2)
+                                        print_progress(
+                                            n_done / np.sum(n_gals)**2)
                                 else:
                                     n_done += (n_gals[i] * n_gals[k] * (
-                                            2 if k != i else 1))
+                                        2 if k != i else 1))
                                     print_progress(n_done / np.sum(n_gals)**2)
-                            if i==k:
+                            if i == k:
                                 xi = tpcf(
                                     pos[i], *tpcf_args,
                                     sample2=pos[k] if k != i else None,
@@ -331,8 +355,8 @@ class TabCorr:
                                     sample2=pos[k] if k != i else None,
                                     do_auto=False, do_cross=True,
                                     period=halocat.Lbox * lbox_stretch,
-                                    **tpcf_kwargs)                                
-                                
+                                    **tpcf_kwargs)
+
                             if 'tpcf_matrix' not in locals():
                                 tpcf_matrix = np.zeros(
                                     (len(xi.ravel()), len(halotab.gal_type),
@@ -361,7 +385,7 @@ class TabCorr:
 
             if not project_xyz or mode == 'cross':
                 break
-        
+
         if comm:
             tpcf_matrix = comm.allreduce(tpcf_matrix, op=MPI.SUM)
 
@@ -477,7 +501,7 @@ class TabCorr:
 
         self.gal_type.write(fname, path='gal_type', append=True)
 
-    def predict(self, model, separate_gal_type=False, **occ_kwargs):
+    def predict(self, model, separate_gal_type=False, baryon_kwargs={}, **occ_kwargs):
         """
         Predicts the number density and correlation function for a certain
         model.
@@ -566,6 +590,70 @@ class TabCorr:
         elif self.attrs['mode'] == 'cross':
             xi = self.tpcf_matrix * ngal / np.sum(ngal)
 
+        # baryonification
+        if (len(baryon_kwargs) > 0) & (has_bcm):
+            #params = {'flat': True, 'H0': 67.2, 'Om0': 0.31, 'Ob0': 0.049, 'sigma8': 0.81, 'ns': 0.95}
+            params = baryon_kwargs['cosmo_params']
+            params['flat'] = True
+            cosmology.addCosmology('myCosmo', params)
+            cosmo = cosmology.setCosmology('myCosmo')
+
+            halo_mass = np.array(self.gal_type['prim_haloprop'])
+            halo_conc = concentration.concentration(halo_mass, 'vir',
+                                                    self.attrs['redshift'],
+                                                    model='diemer19')
+            # fudge factor accounting for scatter in mvir-c relation
+            halo_conc = halo_conc*0.93
+
+            par = bfc.par()
+            par.baryon.eta_tot = baryon_kwargs['eta_tot']
+            par.baryon.eta_cga = baryon_kwargs['eta_cga']
+
+            if 'transfct' in baryon_kwargs.keys():
+                par.files.transfct = baryon_kwargs['transfct']
+            else:
+                dirname = os.path.dirname(os.path.abspath(__file__))
+                par.files.transfct = '{}/files/CDM_PLANCK_tk.dat'.format(
+                    dirname)
+
+            rbin = annular_area_weighted_midpoints(self.tpcf_args[1])
+            rho_r = annular_area_weighted_midpoints(np.logspace(-2, 2, 100))
+
+            # baryon params
+            par.baryon.Mc = baryon_kwargs['Mc']
+            par.baryon.mu = baryon_kwargs['mu']
+            par.baryon.thej = baryon_kwargs['thej']
+            # 2h term
+            start = time()
+            vc_r, vc_m, vc_bias, vc_corr = bfc.cosmo(par)
+            end = time()
+            print('2h term took {}s'.format(end - start))
+
+            start = time()
+            bias_tck = splrep(vc_m, vc_bias, s=0)
+            corr_tck = splrep(vc_r, vc_corr, s=0)
+
+            cosmo_bias = splev(halo_mass, bias_tck)
+            cosmo_corr = splev(rho_r, corr_tck)
+
+            end = time()
+            print('splining took {}s'.format(end - start))
+
+            start = time()
+            correction_factors = np.array([delta_sigma_from_density_profile(rbin, rho_r, bfc.profiles(
+                rho_r, halo_mass[i], halo_conc[i], cosmo_corr, cosmo_bias[i], par)[1])[2] for i in range(len(halo_mass))])
+
+            end = time()
+            print('Final correction calcluation took {}s'.format(end - start))
+
+            # [1] gets density profiles only
+            # [2] gets DS ratios only
+
+            xi = correction_factors.T * xi
+        elif (len(baryon_kwargs) > 0):
+            raise ImportError(
+                "You passed me baryon correction module parameters, but I couldn't import the baryonification module")
+
         if not separate_gal_type:
             ngal = np.sum(ngal)
             xi = np.sum(xi, axis=1).reshape(self.tpcf_shape)
@@ -585,7 +673,7 @@ class TabCorr:
                     mask = symmetric_matrix_to_array(np.outer(
                         gal_type_1 == self.gal_type['gal_type'],
                         gal_type_2 == self.gal_type['gal_type']) |
-                            np.outer(
+                        np.outer(
                         gal_type_2 == self.gal_type['gal_type'],
                         gal_type_1 == self.gal_type['gal_type']))
                     xi_dict['%s-%s' % (gal_type_1, gal_type_2)] = np.sum(
@@ -641,7 +729,7 @@ class TabCorrInterpolation:
                 self.x[:, i] = param_dict_table[key].data
             self.delaunay = Delaunay(self.x)
 
-    def predict(self, model, extrapolate=True, **occ_kwargs):
+    def predict(self, model, extrapolate=True, baryon_kwargs={}, **occ_kwargs):
         """
         Linearly interpolate the predictions from multiple TabCorr instances.
         For example, this function can be used for predict correlation
@@ -709,7 +797,7 @@ class TabCorrInterpolation:
             if np.any(x_model < self.x) and np.any(x_model > self.x):
                 simplex = [np.ma.MaskedArray.argmax(
                     np.ma.masked_array(self.x, mask=(self.x > x_model))),
-                           np.ma.MaskedArray.argmin(
+                    np.ma.MaskedArray.argmin(
                     np.ma.masked_array(self.x, mask=(self.x <= x_model)))]
             else:
                 if not extrapolate:
@@ -724,7 +812,9 @@ class TabCorrInterpolation:
             w = [w1, 1 - w1]
 
         for i, k in enumerate(simplex):
-            ngal_i, xi_i = self.tabcorr_list[k].predict(model, **occ_kwargs)
+            ngal_i, xi_i = self.tabcorr_list[k].predict(model,
+                                                        baryon_kwargs=baryon_kwargs,
+                                                        **occ_kwargs)
             if i == 0:
                 ngal = ngal_i * w[i]
                 xi = xi_i * w[i]
@@ -751,3 +841,57 @@ def symmetric_matrix_to_array(matrix):
             i*n_dim, i*n_dim + i + 1)
 
     return matrix.ravel()[sel]
+
+
+def delta_sigma_from_density_profile(rbin, rho_r, dens, epsabs=1e-3):
+    """
+    Analytically calculated DS profile from density profiles, for both dark matter only (DMO)
+    and dark matter + baryons (DMB). Returns delta sigma in rbin for DMB, DMO, and the ratio between the two.
+    """
+
+    dbin = rbin
+    max_z = 200  # Mpc/h
+
+    Sig_DMO = []
+    Sig_DMB = []
+    avSig_DMO = []
+    avSig_DMB = []
+
+    start = time()
+    densDMO_tck = splrep(rho_r, dens['DMO'])
+    densDMB_tck = splrep(rho_r, dens['DMB'])
+
+    for i in range(len(dbin)):
+        def itgDMO(zz): return splev(
+            (zz**2.0+dbin[i]**2.0)**0.5, densDMO_tck, ext=0)
+        Sig_DMO += [2.0*quad(itgDMO, 0, max_z, limit=200, epsabs=epsabs)[0]]
+        def itgDMB(zz): return splev(
+            (zz**2.0+dbin[i]**2.0)**0.5, densDMB_tck, ext=0)
+        Sig_DMB += [2.0*quad(itgDMB, 0, max_z, limit=200, epsabs=epsabs)[0]]
+
+    end = time()
+    print('First integral took: {}s'.format(end - start))
+    sys.stdout.flush()
+    Sig_DMO = np.array(Sig_DMO)
+    Sig_DMB = np.array(Sig_DMB)
+
+    cumSigDMO_tck = splrep(dbin, Sig_DMO)
+    cumSigDMB_tck = splrep(dbin, Sig_DMB)
+
+    for i in range(len(dbin)):
+        def itgDMO(dd): return dd*splev(dd, cumSigDMO_tck, ext=0)
+        avSig_DMO += [quad(itgDMO, 0, dbin[i], epsabs=epsabs)[0]*2.0/dbin[i]**2.0]
+        def itgDMB(dd): return dd*splev(dd, cumSigDMB_tck, ext=0)
+        avSig_DMB += [quad(itgDMB, 0, dbin[i], epsabs=epsabs)[0]*2.0/dbin[i]**2.0]
+
+    start = time()
+    print('First integral took: {}s'.format(start - end))
+    sys.stdout.flush()
+
+    avSig_DMO = np.array(avSig_DMO)
+    avSig_DMB = np.array(avSig_DMB)
+
+    deltaSigmaDMO = avSig_DMO-Sig_DMO  # (Msun/h) / Mpc^2
+    deltaSigmaDMB = avSig_DMB-Sig_DMB
+
+    return deltaSigmaDMB, deltaSigmaDMO, deltaSigmaDMB / deltaSigmaDMO
