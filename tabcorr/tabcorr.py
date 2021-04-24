@@ -596,7 +596,9 @@ class TabCorr:
             #params = {'flat': True, 'H0': 67.2, 'Om0': 0.31, 'Ob0': 0.049, 'sigma8': 0.81, 'ns': 0.95}
             params = baryon_kwargs['cosmo_params']
             params['flat'] = True
-            use_2h = params.pop('use_2h', True)
+            use_2h = baryon_kwargs.pop('use_2h', True)
+            use_clf_fsat = baryon_kwargs.pop('use_clf_fsat', False)
+            print(use_clf_fsat)
             cosmology.addCosmology('myCosmo', params)
             cosmology.setCosmology('myCosmo')
 
@@ -627,6 +629,16 @@ class TabCorr:
             # fudge factor accounting for scatter in mvir-c relation
             halo_conc_grid = halo_conc_grid*0.93
 
+            if use_clf_fsat:
+                f_sat = np.array([model.model_dictionary['satellites_occupation'].stellar_mass_fraction(m) for m in mhalo_grid])
+                f_cen = np.array([model.model_dictionary['centrals_occupation'].stellar_mass_fraction(m) for m in mhalo_grid])
+                f_star = f_sat + f_cen
+                print(f_star)
+                sys.stdout.flush()
+            else:
+                f_star = [None] * n_mhalo
+                f_cen = [None] * n_mhalo
+
             # baryon params
             par.baryon.Mc = baryon_kwargs['Mc']
             par.baryon.mu = baryon_kwargs['mu']
@@ -646,11 +658,13 @@ class TabCorr:
                                       halo_conc_grid[i],
                                       cosmo_corr,
                                       cosmo_bias_grid[i],
-                                      par)[1] for i in range(len(mhalo_grid))]
+                                      par, fstar=f_star[i], 
+                                      fcga=f_cen[i])[1] for i in range(len(mhalo_grid))]
             else:
                 profs = [bfc.onehalo_profiles(rho_r, mhalo_grid[i],
                                               halo_conc_grid[i],
-                                              par)[1] for i in range(len(mhalo_grid))]
+                                              par,fstar=f_star[i], 
+                                              fcga=f_cen[i])[1] for i in range(len(mhalo_grid))]
 
             correction_factors_grid = [dens_to_ds(rbin, rho_r, profs[i],
                                                   epsabs=1e-1,
