@@ -12,9 +12,10 @@ from halotools.utils import crossmatch
 from halotools.utils.table_utils import compute_conditional_percentiles
 from halotools.mock_observables.surface_density.surface_density_helpers import annular_area_weighted_midpoints
 from time import time
-import sys, os
+import sys
+import os
 
-from scipy.interpolate import splrep, splev
+from scipy.interpolate import splrep, splev, interp1d
 from scipy.integrate import quad
 
 try:
@@ -595,15 +596,11 @@ class TabCorr:
             #params = {'flat': True, 'H0': 67.2, 'Om0': 0.31, 'Ob0': 0.049, 'sigma8': 0.81, 'ns': 0.95}
             params = baryon_kwargs['cosmo_params']
             params['flat'] = True
+            use_2h = params.pop('use_2h', True)
             cosmology.addCosmology('myCosmo', params)
-            cosmo = cosmology.setCosmology('myCosmo')
+            cosmology.setCosmology('myCosmo')
 
             halo_mass = np.array(self.gal_type['prim_haloprop'])
-            halo_conc = concentration.concentration(halo_mass, 'vir',
-                                                    self.attrs['redshift'],
-                                                    model='diemer19')
-            # fudge factor accounting for scatter in mvir-c relation
-            halo_conc = halo_conc*0.93
 
             par = bfc.par()
             par.baryon.eta_tot = baryon_kwargs['eta_tot']
@@ -619,37 +616,56 @@ class TabCorr:
             rbin = annular_area_weighted_midpoints(self.tpcf_args[1])
             rho_r = annular_area_weighted_midpoints(np.logspace(-2, 2, 100))
 
+            n_mhalo = 10
+            mhalo_min = np.min(np.log10(halo_mass))
+            mhalo_max = np.max(np.log10(halo_mass))
+            mhalo_grid = np.logspace(mhalo_min, mhalo_max, n_mhalo)
+
+            halo_conc_grid = concentration.concentration(mhalo_grid, 'vir',
+                                                         self.attrs['redshift'],
+                                                         model='diemer19')
+            # fudge factor accounting for scatter in mvir-c relation
+            halo_conc_grid = halo_conc_grid*0.93
+
             # baryon params
             par.baryon.Mc = baryon_kwargs['Mc']
             par.baryon.mu = baryon_kwargs['mu']
             par.baryon.thej = baryon_kwargs['thej']
-            # 2h term
-            start = time()
-            vc_r, vc_m, vc_bias, vc_corr = bfc.cosmo(par)
-            end = time()
-            print('2h term took {}s'.format(end - start))
+            if use_2h:
+                # 2h term
+                vc_r, vc_m, vc_bias, vc_corr = bfc.cosmo(par)
+                # print('2h term took {}s'.format(end - start))
 
-            start = time()
-            bias_tck = splrep(vc_m, vc_bias, s=0)
-            corr_tck = splrep(vc_r, vc_corr, s=0)
+                bias_tck = splrep(vc_m, vc_bias, s=0)
+                corr_tck = splrep(vc_r, vc_corr, s=0)
 
-            cosmo_bias = splev(halo_mass, bias_tck)
-            cosmo_corr = splev(rho_r, corr_tck)
+                cosmo_bias_grid = splev(mhalo_grid, bias_tck)
+                cosmo_corr = splev(rho_r, corr_tck)
 
-            end = time()
-            print('splining took {}s'.format(end - start))
+                profs = [bfc.profiles(rho_r, mhalo_grid[i],
+                                      halo_conc_grid[i],
+                                      cosmo_corr,
+                                      cosmo_bias_grid[i],
+                                      par)[1] for i in range(len(mhalo_grid))]
+            else:
+                profs = [bfc.onehalo_profiles(rho_r, mhalo_grid[i],
+                                              halo_conc_grid[i],
+                                              par)[1] for i in range(len(mhalo_grid))]
 
-            start = time()
-            correction_factors = np.array([delta_sigma_from_density_profile(rbin, rho_r, bfc.profiles(
-                rho_r, halo_mass[i], halo_conc[i], cosmo_corr, cosmo_bias[i], par)[1])[2] for i in range(len(halo_mass))])
+            correction_factors_grid = [dens_to_ds(rbin, rho_r, profs[i],
+                                                  epsabs=1e-1,
+                                                  epsrel=1e-3)[2]
+                                       for i in range(len(mhalo_grid))]
+            correction_factors_grid = np.array(correction_factors_grid)
+            correction_factors_spl = interp1d(mhalo_grid,
+                                              correction_factors_grid.T,
+                                              fill_value='extrapolate',
+                                              bounds_error=False)
+            correction_factors = correction_factors_spl(halo_mass)
 
-            end = time()
-            print('Final correction calcluation took {}s'.format(end - start))
+            xi = correction_factors * xi
 
-            # [1] gets density profiles only
-            # [2] gets DS ratios only
 
-            xi = correction_factors.T * xi
         elif (len(baryon_kwargs) > 0):
             raise ImportError(
                 "You passed me baryon correction module parameters, but I couldn't import the baryonification module")
@@ -843,7 +859,7 @@ def symmetric_matrix_to_array(matrix):
     return matrix.ravel()[sel]
 
 
-def delta_sigma_from_density_profile(rbin, rho_r, dens, epsabs=1e-3):
+def dens_to_ds(rbin, rho_r, dens, epsabs=1e-3, epsrel=1e-3):
     """
     Analytically calculated DS profile from density profiles, for both dark matter only (DMO)
     and dark matter + baryons (DMB). Returns delta sigma in rbin for DMB, DMO, and the ratio between the two.
@@ -857,21 +873,19 @@ def delta_sigma_from_density_profile(rbin, rho_r, dens, epsabs=1e-3):
     avSig_DMO = []
     avSig_DMB = []
 
-    start = time()
     densDMO_tck = splrep(rho_r, dens['DMO'])
     densDMB_tck = splrep(rho_r, dens['DMB'])
 
     for i in range(len(dbin)):
         def itgDMO(zz): return splev(
             (zz**2.0+dbin[i]**2.0)**0.5, densDMO_tck, ext=0)
-        Sig_DMO += [2.0*quad(itgDMO, 0, max_z, limit=200, epsabs=epsabs)[0]]
+        Sig_DMO += [2.0*quad(itgDMO, 0, max_z, limit=200,
+                             epsabs=epsabs, epsrel=epsrel)[0]]
         def itgDMB(zz): return splev(
             (zz**2.0+dbin[i]**2.0)**0.5, densDMB_tck, ext=0)
-        Sig_DMB += [2.0*quad(itgDMB, 0, max_z, limit=200, epsabs=epsabs)[0]]
+        Sig_DMB += [2.0*quad(itgDMB, 0, max_z, limit=200,
+                             epsabs=epsabs, epsrel=epsrel)[0]]
 
-    end = time()
-    print('First integral took: {}s'.format(end - start))
-    sys.stdout.flush()
     Sig_DMO = np.array(Sig_DMO)
     Sig_DMB = np.array(Sig_DMB)
 
@@ -880,13 +894,12 @@ def delta_sigma_from_density_profile(rbin, rho_r, dens, epsabs=1e-3):
 
     for i in range(len(dbin)):
         def itgDMO(dd): return dd*splev(dd, cumSigDMO_tck, ext=0)
-        avSig_DMO += [quad(itgDMO, 0, dbin[i], epsabs=epsabs)[0]*2.0/dbin[i]**2.0]
-        def itgDMB(dd): return dd*splev(dd, cumSigDMB_tck, ext=0)
-        avSig_DMB += [quad(itgDMB, 0, dbin[i], epsabs=epsabs)[0]*2.0/dbin[i]**2.0]
+        avSig_DMO += [quad(itgDMO, 0, dbin[i], epsabs=epsabs,
+                           epsrel=epsrel)[0]*2.0/dbin[i]**2.0]
 
-    start = time()
-    print('First integral took: {}s'.format(start - end))
-    sys.stdout.flush()
+        def itgDMB(dd): return dd*splev(dd, cumSigDMB_tck, ext=0)
+        avSig_DMB += [quad(itgDMB, 0, dbin[i], epsabs=epsabs,
+                           epsrel=epsrel)[0]*2.0/dbin[i]**2.0]
 
     avSig_DMO = np.array(avSig_DMO)
     avSig_DMB = np.array(avSig_DMB)
